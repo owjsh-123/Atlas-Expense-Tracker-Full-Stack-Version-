@@ -1,0 +1,5 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import {summarize,validateTransaction,toCsv,parseCsvRows} from '../src/logic.js';
+test('monthly summary filters by month and computes totals',()=>{const data=[{date:'2026-10-01',type:'income',amount:1500,category:'Other'},{date:'2026-10-02',type:'expense',amount:120,category:'Food & Drinks'},{date:'2026-09-01',type:'expense',amount:50,category:'Other'}];assert.deepEqual(summarize(data,'2026-10'),{income:1500,expenses:120,balance:1380,byCategory:{'Food & Drinks':120},count:2});});
+test('validations reject missing titles and negative amounts',()=>{assert.throws(()=>validateTransaction({title:'',type:'expense',amount:2,date:'2026-10-01'}));assert.throws(()=>validateTransaction({title:'X',type:'expense',amount:-3,date:'2026-10-01'}));});
+test('CSV export/import handles quotes and commas',()=>{const t=[{date:'2026-10-01',type:'expense',title:'Lunch, "special"',category:'Food & Drinks',amount:13.25}];const parsed=parseCsvRows(toCsv(t));assert.equal(parsed[1][2],t[0].title);assert.equal(parsed[1][4],'13.25');});

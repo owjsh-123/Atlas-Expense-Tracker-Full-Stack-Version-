@@ -1,0 +1,45 @@
+import {createServer} from 'node:http';
+import {readFile, mkdir} from 'node:fs/promises';
+import {resolve, extname, sep} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
+import {randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash} from 'node:crypto';
+const root=resolve(process.cwd());
+await mkdir(resolve(root,'data'),{recursive:true});
+const db=new DatabaseSync(resolve(root,'data','atlas.sqlite'));
+db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,name TEXT NOT NULL,secret TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,type TEXT NOT NULL CHECK(type IN ('income','expense')),title TEXT NOT NULL,category TEXT NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),date TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS budgets(user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,month TEXT NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),PRIMARY KEY(user_id,month));`);
+const secretHash=password=>{const salt=randomBytes(16).toString('hex');return salt+':'+scryptSync(password,salt,64).toString('hex')};
+const verify=(password,hash)=>{const [salt,expected]=hash.split(':');const actual=scryptSync(password,salt,64);return timingSafeEqual(actual,Buffer.from(expected,'hex'))};
+const sha=s=>createHash('sha256').update(s).digest('hex');
+const send=(res,status,data,headers={})=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers});res.end(JSON.stringify(data))};
+const readJson=async req=>{let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>1000000)throw Error('Request too large')}return JSON.parse(raw||'{}')};
+const cookie=req=>Object.fromEntries((req.headers.cookie||'').split(';').map(x=>x.trim().split('=').map(decodeURIComponent)).filter(x=>x.length===2));
+const who=req=>{const token=cookie(req).atlas_session;if(!token)return null;return db.prepare('SELECT users.id,users.name,users.email FROM sessions JOIN users ON users.id=sessions.user_id WHERE token_hash=? AND expires_at>?').get(sha(token),Date.now())||null};
+const secureCookie=process.env.NODE_ENV==='production'?'; Secure':'';
+const cookieHeader=token=>`atlas_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${secureCookie}`;
+const resetCookie=`atlas_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secureCookie}`;
+const dateValid=s=>/^\d{4}-\d{2}-\d{2}$/.test(s)&&!Number.isNaN(Date.parse(s+'T12:00:00Z'))&&new Date(s+'T12:00:00Z').toISOString().slice(0,10)===s;
+const monthValid=s=>/^\d{4}-(0[1-9]|1[0-2])$/.test(s);
+const money=v=>Number.isFinite(Number(v))&&Number(v)>0&&Number(v)<=100000000?Math.round(Number(v)*100):null;
+const login=(res,u)=>{const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(sha(token),u.id,Date.now()+604800000);send(res,200,{user:{id:u.id,name:u.name,email:u.email}}, {'Set-Cookie':cookieHeader(token)})};
+const routes=async(req,res,path,url)=>{
+ if(path==='/api/register'&&req.method==='POST'){const b=await readJson(req);const email=String(b.email||'').trim().toLowerCase(),name=String(b.name||'').trim(),password=String(b.password||'');if(!/^\S+@\S+\.\S+$/.test(email)||name.length<2||name.length>80||password.length<10||password.length>200)return send(res,400,{error:'Enter a valid email, name, and a password of at least 10 characters.'});if(db.prepare('SELECT id FROM users WHERE email=?').get(email))return send(res,409,{error:'Email already registered.'});const u={id:randomUUID(),name,email};db.prepare('INSERT INTO users(id,name,email,secret) VALUES(?,?,?,?)').run(u.id,name,email,secretHash(password));return login(res,u)}
+ if(path==='/api/login'&&req.method==='POST'){const b=await readJson(req);const user=db.prepare('SELECT * FROM users WHERE email=?').get(String(b.email||'').trim().toLowerCase());if(!user||!verify(String(b.password||''),user.secret))return send(res,401,{error:'Incorrect email or password.'});return login(res,user)}
+ if(path==='/api/logout'&&req.method==='POST'){const token=cookie(req).atlas_session;if(token)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(sha(token));return send(res,200,{ok:true},{'Set-Cookie':resetCookie})}
+ const u=who(req);if(!u)return send(res,401,{error:'Please log in.'});
+ if(path==='/api/me'&&req.method==='GET')return send(res,200,{user:u});
+ if(path==='/api/transactions'&&req.method==='GET'){const rows=db.prepare('SELECT id,type,title,category,amount,date FROM transactions WHERE user_id=? ORDER BY date DESC,created_at DESC').all(u.id).map(t=>({...t,amount:t.amount/100}));return send(res,200,{transactions:rows})}
+ if(path==='/api/transactions'&&req.method==='POST'){const b=await readJson(req),amount=money(b.amount),date=String(b.date||''),title=String(b.title||'').trim(),category=String(b.category||'Other').trim();if(!amount||!dateValid(date)||!['income','expense'].includes(b.type)||!title||title.length>120||!category||category.length>70)return send(res,400,{error:'Invalid transaction details.'});const id=randomUUID();db.prepare('INSERT INTO transactions(id,user_id,type,title,category,amount,date) VALUES(?,?,?,?,?,?,?)').run(id,u.id,b.type,title,category,amount,date);return send(res,201,{transaction:{id,type:b.type,title,category,amount:amount/100,date}})}
+ const match=path.match(/^\/api\/transactions\/([0-9a-f-]{36})$/);if(match&&req.method==='DELETE'){const result=db.prepare('DELETE FROM transactions WHERE id=? AND user_id=?').run(match[1],u.id);return send(res,result.changes?200:404,{ok:!!result.changes})}
+ if(path==='/api/budget'&&req.method==='GET'){const month=url.searchParams.get('month');if(!monthValid(month||''))return send(res,400,{error:'Invalid month.'});const budget=db.prepare('SELECT amount FROM budgets WHERE user_id=? AND month=?').get(u.id,month);return send(res,200,{amount:budget?budget.amount/100:2000})}
+ if(path==='/api/budget'&&req.method==='PUT'){const b=await readJson(req),amount=money(b.amount);if(!monthValid(String(b.month||''))||!amount)return send(res,400,{error:'Invalid budget.'});db.prepare('INSERT INTO budgets(user_id,month,amount) VALUES(?,?,?) ON CONFLICT(user_id,month) DO UPDATE SET amount=excluded.amount').run(u.id,b.month,amount);return send(res,200,{amount:amount/100})}
+ if(path==='/api/import'&&req.method==='POST'){const b=await readJson(req);if(!Array.isArray(b.transactions)||b.transactions.length>5000)return send(res,400,{error:'Maximum 5,000 transactions.'});const cleaned=b.transactions.map(t=>({type:t.type,title:String(t.title||'').trim(),category:String(t.category||'Other').trim(),date:String(t.date||''),amount:money(t.amount)}));if(cleaned.some(t=>!['income','expense'].includes(t.type)||!t.title||t.title.length>120||!t.category||t.category.length>70||!dateValid(t.date)||!t.amount))return send(res,400,{error:'Invalid transactions in import.'});db.exec('BEGIN');try{const stmt=db.prepare('INSERT INTO transactions(id,user_id,type,title,category,date,amount) VALUES(?,?,?,?,?,?,?)');for(const t of cleaned)stmt.run(randomUUID(),u.id,t.type,t.title,t.category,t.date,t.amount);db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}return send(res,200,{count:cleaned.length})}
+ if(path==='/api/transactions'&&req.method==='DELETE'){db.prepare('DELETE FROM transactions WHERE user_id=?').run(u.id);return send(res,200,{ok:true})}
+ return send(res,404,{error:'Not found.'});
+};
+const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.json':'application/json'};
+const port=Number(process.env.PORT||5173);
+createServer(async(req,res)=>{let url;try{url=new URL(req.url,'http://localhost')}catch{return send(res,400,{error:'Bad URL.'})};try{if(url.pathname.startsWith('/api/'))return await routes(req,res,url.pathname,url);if(!['GET','HEAD'].includes(req.method))return send(res,405,{error:'Method not allowed.'});const path=resolve(root,'.'+(url.pathname==='/'?'/index.html':decodeURIComponent(url.pathname)));if(path!==root&&!path.startsWith(root+sep))return send(res,403,{error:'Forbidden.'});if(path.includes(sep+'data'+sep)||path.includes(sep+'.git'+sep)||path.endsWith('.sqlite')||path.endsWith('.env'))return send(res,403,{error:'Forbidden.'});const body=await readFile(path);res.writeHead(200,{'Content-Type':types[extname(path)]||'application/octet-stream','X-Content-Type-Options':'nosniff'});res.end(req.method==='HEAD'?undefined:body)}catch(e){if(e.code==='ENOENT')return send(res,404,{error:'Not found.'});if(e instanceof SyntaxError)return send(res,400,{error:'Invalid JSON.'});console.error(e);return send(res,500,{error:'Server error.'})}}).listen(port,()=>console.log(`Atlas full-stack app at http://localhost:${port}`));
